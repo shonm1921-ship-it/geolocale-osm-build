@@ -10,6 +10,7 @@
 // push. /api/overpass reads the manifest, so a published city answers without a deploy.
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, statSync, unlinkSync, mkdirSync } from "node:fs";
+import { gzipSync } from "node:zlib";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -95,11 +96,18 @@ function publish(cityId) {
   }
   const tag = `cities-${c.continent}`;
   ensureRelease(tag);
-  run("gh", ["release", "upload", tag, file, "--repo", OWNER_REPO, "--clobber"]);
-  const bytes = statSync(file).size;
+  // Published gzipped: a third to a quarter of the bytes, so a cold server fetches London in a
+  // fraction of the time. The function unzips it (api/_owndata.ts).
+  const rawBytes = statSync(file).size;
+  const gz = `${file}.gz`;
+  writeFileSync(gz, gzipSync(readFileSync(file), { level: 9 }));
+  run("gh", ["release", "upload", tag, gz, "--repo", OWNER_REPO, "--clobber"]);
+  try { run("gh", ["release", "delete-asset", tag, `${cityId}.sqlite`, "--repo", OWNER_REPO, "--yes"]); } catch { /* none */ }
+  const bytes = statSync(gz).size;
+  unlinkSync(gz);
   state.published[cityId] = { city: cityId, name: c.name, country: c.country, s: c.s, w: c.w, n: c.n, e: c.e,
-    osm_date: meta[0], places: meta[1], lines: meta[2], buildings: meta[3], source: meta[4], bytes,
-    url: `https://github.com/${OWNER_REPO}/releases/download/${tag}/${cityId}.sqlite` };
+    osm_date: meta[0], places: meta[1], lines: meta[2], buildings: meta[3], source: meta[4], bytes, rawBytes,
+    url: `https://github.com/${OWNER_REPO}/releases/download/${tag}/${cityId}.sqlite.gz` };
   unlinkSync(file);
   log(`published ${cityId} ${(bytes / 1e6).toFixed(1)} MB ${meta[1]} places`);
 }
