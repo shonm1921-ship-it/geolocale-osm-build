@@ -64,8 +64,16 @@ def cities_of(lat, lng):
     others missing it: Ra'anana came out with 78 places on 2026-10-21, before this."""
     return [c[0] for c in CITIES if c[1] <= lat <= c[3] and c[2] <= lng <= c[4]]
 
+# Kept although DROP names their prefix. Measured 2026-11-13: the "check_date" prefix removed
+# check_date:opening_hours from every place (0 left in 158,201), so the app cannot say how old
+# a place's mapped hours are, and Day and night (src/lib/areaHours.ts) has to say that the age
+# is not recorded. From the NEXT build on the date a mapper last confirmed the hours is kept.
+# opening_hours:signed (whether the hours are posted at the door) already passes DROP; it is
+# named here so a later, wider DROP does not remove it by accident.
+KEEP = ("check_date:opening_hours", "opening_hours:signed")
+
 def keep_tags(tags):
-    return {k: v for k, v in tags.items() if not k.startswith(DROP) and len(v) < 300}
+    return {k: v for k, v in tags.items() if (k in KEEP or not k.startswith(DROP)) and len(v) < 300}
 
 POI_KEYSET = sorted({k for k, _ in POI_KV})
 
