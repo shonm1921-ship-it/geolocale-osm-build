@@ -9,7 +9,7 @@
 // slim.py, upload as a release asset (one release per continent), add it to manifest.json,
 // push. /api/overpass reads the manifest, so a published city answers without a deploy.
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, statSync, unlinkSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, unlinkSync, mkdirSync, appendFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,6 +53,20 @@ mkdirSync(citiesDir, { recursive: true });
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), `w${WORKER}`, ...a);
 const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1 << 26, ...opts }).toString();
 
+// WHAT WENT WRONG, SAID OUT LOUD. Every failure below used to be a log line followed by
+// `continue`, and the process still ended with status 0. On 2026-11-20 a run downloaded
+// nothing ("download failed (1..3) nauru"), published 0 cities, and GitHub showed it green.
+// A refresh that silently publishes nothing is how a "weekly" file goes months stale.
+// Each failure is now kept, printed at the end as an error GitHub shows on the run, written to
+// the run's summary, and the process ends with status 1, which fails the job and makes GitHub
+// send its failure email. Every region is still attempted first: one bad download must not
+// stop the others. A city held back by the size guard is a warning, not a failure: the guard
+// did its job and the published file stays.
+const problems = [];
+const problem = (kind, what, detail) => { problems.push({ kind, what, detail: String(detail ?? "").trim().slice(0, 300) }); };
+/** The part of a failed command's output that says why: the last line of what it wrote to stderr. */
+const why = (e) => (String(e?.stderr ?? "").trim().split("\n").filter(Boolean).pop() || String(e?.message ?? e)).slice(0, 300);
+
 // Demo cities' regions first, then the regions that finish the most cities per gigabyte.
 // Shares: union regions that a city spans, then hand the groups out largest first to the
 // lightest share.
@@ -84,7 +98,7 @@ function ensureRelease(tag) {
 function publish(cityId) {
   const c = cityById[cityId];
   const file = join(citiesDir, `${cityId}.sqlite`);
-  if (!existsSync(file)) { log(`no file for ${cityId}`); return; }
+  if (!existsSync(file)) { log(`no file for ${cityId}`); problem("publish", cityId, "the build wrote no file for this city"); return; }
   run("python3", ["-I", join(SCRIPTS, "slim.py"), file]);
   const meta = JSON.parse(run(PY, ["-c", `import sqlite3,json;d=sqlite3.connect(${JSON.stringify(file)});r=d.execute("select osm_date,places,lines,buildings,source from meta where city=?",(${JSON.stringify(cityId)},)).fetchone();print(json.dumps(r))`]));
   const before = previous[cityId]?.places;
@@ -120,8 +134,10 @@ function pushManifest() {
     try { theirs = JSON.parse(readFileSync(join(REPO, "manifest.json"), "utf8")).cities ?? []; } catch { /* first */ }
     const merged = Object.fromEntries(theirs.map((c) => [c.city, c]));
     Object.assign(merged, state.published);
-    if (writeManifest(Object.values(merged))) return;
+    if (writeManifest(Object.values(merged))) return true;
   }
+  // Four tries lost the race or the network: the files are uploaded and the list does not name them.
+  return false;
 }
 
 function writeManifest(list) {
@@ -138,12 +154,12 @@ for (const r of regions) {
   if (state.regionsDone.includes(r.region)) continue;
   const pbf = join(WORK, `region-${WORKER}.osm.pbf`);
   log(`region ${r.region} ${(r.bytes / 1e6).toFixed(0)} MB, cities ${r.cities.join(" ")}`);
-  let ok = false;
+  let ok = false, lastWhy = "";
   for (let t = 1; t <= 3 && !ok; t++) {
     try { run("curl", ["-sSfL", "--retry", "3", "-A", UA, "-o", pbf, r.pbf], { timeout: 3 * 3600_000 }); ok = true; }
-    catch (e) { log(`download failed (${t}) ${r.region}: ${String(e.message).slice(0, 120)}`); }
+    catch (e) { lastWhy = why(e); log(`download failed (${t}) ${r.region}: ${lastWhy}`); }
   }
-  if (!ok) continue;
+  if (!ok) { problem("download", r.region, `${lastWhy} (${r.pbf}); cities not refreshed: ${r.cities.join(" ")}`); continue; }
   // A city with a file from an earlier region keeps it and adds to it.
   const append = r.cities.filter((c) => existsSync(join(citiesDir, `${c}.sqlite`)));
   const boxes = r.cities.map((id) => { const c = cityById[id]; return `${id}:${c.s},${c.w},${c.n},${c.e}`; });
@@ -151,17 +167,44 @@ for (const r of regions) {
     const out = run(PY, [join(SCRIPTS, "build.py"), pbf, citiesDir, ...boxes],
       { env: { ...process.env, OWNDATA_APPEND: append.join(",") }, timeout: 6 * 3600_000 });
     log(out.trim().slice(0, 300));
-  } catch (e) { log(`build failed ${r.region}: ${String(e.stderr ?? e.message).slice(-300)}`); try { unlinkSync(pbf); } catch {} continue; }
+  } catch (e) {
+    log(`build failed ${r.region}: ${String(e.stderr ?? e.message).slice(-300)}`);
+    problem("build", r.region, `${why(e)}; cities not refreshed: ${r.cities.join(" ")}`);
+    try { unlinkSync(pbf); } catch {}
+    continue;
+  }
   try { unlinkSync(pbf); } catch {}
   state.regionsDone.push(r.region);
   for (const id of r.cities) {
     const c = cityById[id];
     if (state.published[id]) continue;
     if (c.regions.every((x) => state.regionsDone.includes(x))) {
-      try { publish(id); } catch (e) { log(`publish failed ${id}: ${String(e.stderr ?? e.message).slice(-200)}`); }
+      try { publish(id); } catch (e) { log(`publish failed ${id}: ${String(e.stderr ?? e.message).slice(-200)}`); problem("publish", id, why(e)); }
     }
   }
   save();
-  try { pushManifest(); } catch (e) { log(`manifest push failed: ${String(e.message).slice(0, 160)}`); }
+  try { if (!pushManifest()) { log("manifest push failed after four tries"); problem("manifest", r.region, "the city list could not be pushed after four tries"); } }
+  catch (e) { log(`manifest push failed: ${String(e.message).slice(0, 160)}`); problem("manifest", r.region, why(e)); }
 }
 log(`worker ${WORKER}/${WORKERS} done: ${Object.keys(state.published).length} of ${plan.cities.length} cities published`);
+
+// The reckoning (see `problems` above). GitHub reads "::error" and "::warning" lines from the
+// output and shows them on the run; a message is one line, so newlines are encoded its way.
+const oneLine = (t) => String(t).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+const held = Object.entries(state.heldBack ?? {});
+for (const [city, h] of held) console.log(`::warning title=Held back: ${city}::${oneLine(`${h.now} places against ${h.before} published. The published file stays.`)}`);
+for (const p of problems) console.log(`::error title=${p.kind} failed: ${p.what}::${oneLine(p.detail)}`);
+if (process.env.GITHUB_STEP_SUMMARY && (regions.length || problems.length)) {
+  try {
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+      `### Worker ${WORKER}/${WORKERS}: ${regions.length} region${regions.length === 1 ? "" : "s"}, ${problems.length ? `${problems.length} FAILED` : "no failures"}`,
+      ...problems.map((p) => `- ${p.kind} failed, ${p.what}: ${p.detail}`),
+      ...held.map(([city, h]) => `- held back, ${city}: ${h.now} places against ${h.before} published`),
+      "",
+    ].join("\n"));
+  } catch { /* the summary is a convenience; the status below is what counts */ }
+}
+if (problems.length) {
+  log(`FAILED: ${problems.length} problem${problems.length === 1 ? "" : "s"} on this worker (${problems.map((p) => `${p.kind} ${p.what}`).join(", ")}). Ending with status 1 so the run is marked failed.`);
+  process.exitCode = 1;
+}
